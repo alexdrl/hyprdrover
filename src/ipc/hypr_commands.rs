@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::process::Command;
 use std::fs;
+use std::process::Command;
+use std::sync::OnceLock;
 
 // --- Data Models (matching hyprctl -j output) ---
 
@@ -162,49 +163,140 @@ pub fn capture_state() -> Result<SessionSnapshot, Box<dyn Error>> {
 
 // --- Dispatch Commands (Actions) ---
 
-/// Execute a raw hyprctl dispatch command
-pub fn dispatch(command: &str) -> Result<(), Box<dyn Error>> {
-    let args: Vec<&str> = command.split_whitespace().collect();
-    let output = Command::new("hyprctl")
-        .arg("dispatch")
-        .args(&args)
-        .output()?;
+/// Cached detection of the `hyprland-lua` plugin parser.
+static LUA_PARSER: OnceLock<bool> = OnceLock::new();
 
-    if !output.status.success() {
+/// Detect whether the `hyprland-lua` plugin parser is active.
+///
+/// Under that parser, `hyprctl dispatch <native>` is evaluated as a *Lua
+/// expression* (`return hl.dispatch(<native>)`) and silently fails — so window
+/// moves/resizes never happen. When detected we emit `hl.dsp.*` Lua calls
+/// instead of native dispatchers.
+///
+/// Probe: `hl.dsp.no_op()` returns "ok" only when the Lua parser interprets it;
+/// a stock Hyprland reports an invalid dispatcher.
+fn lua_parser() -> bool {
+    *LUA_PARSER.get_or_init(|| {
+        Command::new("hyprctl")
+            .args(["dispatch", "hl.dsp.no_op()"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "ok")
+            .unwrap_or(false)
+    })
+}
+
+/// Render a workspace selector as a Lua value: a bare number for numeric ids,
+/// or a quoted string for names like `special:magic`.
+fn lua_workspace(target: &str) -> String {
+    if target.parse::<i32>().is_ok() {
+        target.to_string()
+    } else {
+        format!("\"{}\"", target)
+    }
+}
+
+/// Run a single, already-formatted `hyprctl dispatch <arg>`.
+///
+/// The whole command is passed as ONE argument (never split on whitespace) so
+/// Lua expressions like `hl.dsp.window.move({ ... })` survive intact. Under the
+/// Lua parser, errors are reported on stdout with exit code 0, so we also scan
+/// stdout for an `error:` marker.
+fn dispatch_arg(arg: &str) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("hyprctl").arg("dispatch").arg(arg).output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || stdout.trim_start().starts_with("error:") {
         return Err(format!(
-            "Dispatch failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "Dispatch failed: {}{}",
+            stdout.trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
         )
         .into());
     }
-
     Ok(())
 }
 
-/// Move a specific window to a workspace (silently)
-pub fn move_window_to_workspace(address: &str, workspace_id: i32) -> Result<(), Box<dyn Error>> {
-    let cmd = format!("movetoworkspacesilent {},address:{}", workspace_id, address);
-    dispatch(&cmd)
-}
-
-/// Focus a specific window
+/// Execute a raw hyprctl dispatch command (native syntax).
+/// Kept for completeness; prefer the semantic helpers below.
 #[allow(dead_code)]
-pub fn focus_window(address: &str) -> Result<(), Box<dyn Error>> {
-    let cmd = format!("focuswindow address:{}", address);
-    dispatch(&cmd)
+pub fn dispatch(command: &str) -> Result<(), Box<dyn Error>> {
+    dispatch_arg(command)
 }
 
-/// Move a window to a specific pixel coordinate
+/// Move a specific window to a workspace.
+/// `target` is a workspace selector: a numeric id (e.g. "3") or a name
+/// (e.g. "special:magic" for special workspaces).
+pub fn move_window_to_workspace_target(address: &str, target: &str) -> Result<(), Box<dyn Error>> {
+    let arg = if lua_parser() {
+        format!(
+            "hl.dsp.window.move({{ workspace = {}, window = \"address:{}\" }})",
+            lua_workspace(target),
+            address
+        )
+    } else {
+        format!("movetoworkspacesilent {},address:{}", target, address)
+    };
+    dispatch_arg(&arg)
+}
+
+/// Toggle the floating state of a specific window.
+pub fn toggle_floating(address: &str) -> Result<(), Box<dyn Error>> {
+    let arg = if lua_parser() {
+        format!(
+            "hl.dsp.window.float({{ action = \"toggle\", window = \"address:{}\" }})",
+            address
+        )
+    } else {
+        format!("togglefloating address:{}", address)
+    };
+    dispatch_arg(&arg)
+}
+
+/// Move a window to an exact pixel coordinate (used for floating windows).
 pub fn move_window_pixel(address: &str, x: i32, y: i32) -> Result<(), Box<dyn Error>> {
-    let cmd = format!("movewindowpixel exact {} {},address:{}", x, y, address);
-    dispatch(&cmd)
+    let arg = if lua_parser() {
+        format!(
+            "hl.dsp.window.move({{ x = {}, y = {}, window = \"address:{}\" }})",
+            x, y, address
+        )
+    } else {
+        format!("movewindowpixel exact {} {},address:{}", x, y, address)
+    };
+    dispatch_arg(&arg)
 }
 
-/// Resize a window to specific dimensions
+/// Resize a window to exact dimensions.
 pub fn resize_window_pixel(address: &str, width: i32, height: i32) -> Result<(), Box<dyn Error>> {
-    let cmd = format!(
-        "resizewindowpixel exact {} {},address:{}",
-        width, height, address
-    );
-    dispatch(&cmd)
+    let arg = if lua_parser() {
+        format!(
+            "hl.dsp.window.resize({{ x = {}, y = {}, window = \"address:{}\" }})",
+            width, height, address
+        )
+    } else {
+        format!("resizewindowpixel exact {} {},address:{}", width, height, address)
+    };
+    dispatch_arg(&arg)
+}
+
+/// Switch the focused monitor to a workspace (by numeric id).
+pub fn focus_workspace(id: i32) -> Result<(), Box<dyn Error>> {
+    let arg = if lua_parser() {
+        format!("hl.dsp.focus({{ workspace = {} }})", id)
+    } else {
+        format!("workspace {}", id)
+    };
+    dispatch_arg(&arg)
+}
+
+/// Launch a command onto a target workspace.
+/// `target` is a workspace selector (numeric id or name). Under the Lua parser
+/// the workspace rule doesn't reliably place the window, so the caller's
+/// post-launch poll is relied upon to reposition it.
+pub fn exec_on_workspace(cmd: &str, target: &str) -> Result<(), Box<dyn Error>> {
+    let arg = if lua_parser() {
+        let escaped = cmd.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("hl.dsp.exec_cmd(\"{}\")", escaped)
+    } else {
+        format!("exec [workspace {} silent] {}", target, cmd)
+    };
+    dispatch_arg(&arg)
 }
