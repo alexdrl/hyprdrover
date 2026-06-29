@@ -46,6 +46,12 @@ pub struct HyprClient {
     /// Used only if command is unavailable.
     #[serde(default)]
     pub exe_path: Option<String>,
+
+    /// Addresses of all windows in this window's group (tabbed group),
+    /// including itself. Empty when the window is not grouped. The order
+    /// reflects the tab order. Reported directly by `hyprctl clients`.
+    #[serde(default)]
+    pub grouped: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -273,6 +279,28 @@ pub fn resize_window_pixel(address: &str, width: i32, height: i32) -> Result<(),
         )
     } else {
         format!("resizewindowpixel exact {} {},address:{}", width, height, address)
+    };
+    dispatch_arg(&arg)
+}
+
+/// Focus a specific window by address.
+pub fn focus_window(address: &str) -> Result<(), Box<dyn Error>> {
+    let arg = if lua_parser() {
+        format!("hl.dsp.focus({{ window = \"address:{}\" }})", address)
+    } else {
+        format!("focuswindow address:{}", address)
+    };
+    dispatch_arg(&arg)
+}
+
+/// Toggle the group state of the focused window (creates or dissolves a group).
+/// With `group:auto_group` enabled (Hyprland's default), windows launched while
+/// a group is focused are added to it — this is how restore rebuilds groups.
+pub fn toggle_group() -> Result<(), Box<dyn Error>> {
+    let arg = if lua_parser() {
+        "hl.dsp.group.toggle()".to_string()
+    } else {
+        "togglegroup".to_string()
     };
     dispatch_arg(&arg)
 }

@@ -1,7 +1,7 @@
 pub mod position;
 
 use crate::ipc::{self, HyprClient, HyprWorkspaceRef, SessionSnapshot};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::time::{Duration, Instant};
 
@@ -57,16 +57,43 @@ pub fn restore_session(snapshot: &SessionSnapshot) -> Result<(), Box<dyn Error>>
     if missing.is_empty() {
         println!("Phase 2: nothing to launch — every saved window was already open.");
     } else {
-        println!("Phase 2: launching {} missing window(s)...", missing.len());
-        for saved in &missing {
-            launch_app(saved);
+        // Separate window groups (rebuilt member-by-member) from solo windows.
+        let groups = plan_groups(&missing);
+        let grouped_addrs: HashSet<&str> = groups
+            .iter()
+            .flat_map(|g| g.iter().map(|c| c.address.as_str()))
+            .collect();
+        let solo: Vec<&HyprClient> = missing
+            .iter()
+            .copied()
+            .filter(|c| !grouped_addrs.contains(c.address.as_str()))
+            .collect();
+
+        println!(
+            "Phase 2: launching {} window(s) — {} solo, {} in {} group(s)...",
+            missing.len(),
+            solo.len(),
+            grouped_addrs.len(),
+            groups.len()
+        );
+
+        // Solo windows: launch all, then a single global poll positions them.
+        if !solo.is_empty() {
+            for saved in &solo {
+                launch_app(saved);
+            }
+            position_launched(
+                &solo,
+                &baseline_addresses,
+                &mut restored_addresses,
+                Duration::from_secs(15),
+            )?;
         }
-        position_launched(
-            &missing,
-            &baseline_addresses,
-            &mut restored_addresses,
-            Duration::from_secs(15),
-        )?;
+
+        // Groups: rebuilt one window at a time so auto_group tabs them together.
+        for group in &groups {
+            restore_group(group, &mut restored_addresses, Duration::from_secs(15))?;
+        }
     }
 
     // Return to the workspace we started on (best effort).
@@ -235,6 +262,123 @@ fn position_launched(
     }
 
     Ok(())
+}
+
+/// Detect the window groups to rebuild from the missing windows.
+///
+/// A group is rebuilt only if EVERY member is missing (none already open):
+/// Hyprland's lua build can't pull a pre-existing window into a group, so a
+/// partially-open group is left to fall back to solo launches. Members are
+/// returned in the saved tab order (the order of the `grouped` list).
+fn plan_groups<'a>(missing: &[&'a HyprClient]) -> Vec<Vec<&'a HyprClient>> {
+    let by_addr: HashMap<&str, &HyprClient> =
+        missing.iter().map(|c| (c.address.as_str(), *c)).collect();
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut groups: Vec<Vec<&HyprClient>> = Vec::new();
+
+    for client in missing {
+        if client.grouped.len() < 2 {
+            continue; // not part of a group
+        }
+        // Stable group identity: sorted member addresses.
+        let mut key_parts = client.grouped.clone();
+        key_parts.sort();
+        let key = key_parts.join(",");
+        if !seen.insert(key) {
+            continue; // already handled this group
+        }
+
+        // Resolve members in tab order; bail if any member isn't in `missing`.
+        let members: Option<Vec<&HyprClient>> = client
+            .grouped
+            .iter()
+            .map(|addr| by_addr.get(addr.as_str()).copied())
+            .collect();
+        if let Some(members) = members {
+            if members.len() >= 2 {
+                groups.push(members);
+            }
+        }
+    }
+    groups
+}
+
+/// Rebuild a tabbed window group by launching its members one at a time:
+/// launch the leader, turn it into a group, then launch the rest while the
+/// group stays focused so `auto_group` (Hyprland default) tabs them in.
+fn restore_group(
+    members: &[&HyprClient],
+    restored_addresses: &mut HashSet<String>,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let leader = members[0];
+    println!(
+        "   ⊞ Rebuilding group of {} ({}) on {}",
+        members.len(),
+        leader.class,
+        workspace_label(&leader.workspace)
+    );
+
+    // 1. Launch the leader and wait for its window.
+    let Some(leader_addr) = launch_and_wait(leader, restored_addresses, timeout)? else {
+        eprintln!(
+            "   ⚠️ Group leader {} never appeared; skipping group",
+            leader.class
+        );
+        return Ok(());
+    };
+
+    // 2. Move it to its workspace and make it a group.
+    let _ = ipc::move_window_to_workspace_target(&leader_addr, &workspace_target(&leader.workspace));
+    ipc::focus_window(&leader_addr)?;
+    if let Err(e) = ipc::toggle_group() {
+        eprintln!("   ⚠️ Could not create group for {}: {}", leader.class, e);
+    }
+
+    // 3. Launch the remaining members into the focused group.
+    for member in &members[1..] {
+        ipc::focus_window(&leader_addr)?; // keep the group focused
+        match launch_and_wait(member, restored_addresses, timeout)? {
+            Some(_) => println!("   ✓ Tabbed {} into group", member.class),
+            None => eprintln!("   ⚠️ Group member {} never appeared", member.class),
+        }
+    }
+
+    Ok(())
+}
+
+/// Launch one app and poll until its window appears, returning its address.
+/// Uses a per-launch baseline so the freshly spawned window is identified even
+/// among same-class siblings.
+fn launch_and_wait(
+    saved: &HyprClient,
+    restored_addresses: &mut HashSet<String>,
+    timeout: Duration,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let before: HashSet<String> = ipc::capture_state()?
+        .clients
+        .into_iter()
+        .map(|c| c.address)
+        .collect();
+
+    launch_app(saved);
+
+    let poll_interval = Duration::from_millis(250);
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let state = ipc::capture_state()?;
+        if let Some(client) = state.clients.iter().find(|c| {
+            !before.contains(&c.address)
+                && !restored_addresses.contains(&c.address)
+                && launched_window_matches(c, saved)
+        }) {
+            restored_addresses.insert(client.address.clone());
+            return Ok(Some(client.address.clone()));
+        }
+        std::thread::sleep(poll_interval);
+    }
+    Ok(None)
 }
 
 fn launched_window_matches(current: &HyprClient, saved: &HyprClient) -> bool {
