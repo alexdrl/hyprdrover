@@ -305,6 +305,44 @@ pub fn toggle_group() -> Result<(), Box<dyn Error>> {
     dispatch_arg(&arg)
 }
 
+/// Read the current value of `group:group_on_movetoworkspace`.
+/// Returns false if it can't be determined.
+pub fn get_group_on_movetoworkspace() -> bool {
+    run_hyprctl(&["getoption", "group:group_on_movetoworkspace"])
+        .ok()
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+        .and_then(|v| v.get("int").and_then(|i| i.as_i64()))
+        .map(|i| i != 0)
+        .unwrap_or(false)
+}
+
+/// Set `group:group_on_movetoworkspace`. When enabled, moving a window into a
+/// workspace that holds a group merges it into that group — the only way to add
+/// an already-open window to a group under the lua build (no `moveintogroup`).
+pub fn set_group_on_movetoworkspace(enabled: bool) -> Result<(), Box<dyn Error>> {
+    if lua_parser() {
+        let arg = format!(
+            "hl.config({{ group = {{ group_on_movetoworkspace = {} }} }}) or hl.dsp.no_op()",
+            enabled
+        );
+        dispatch_arg(&arg)
+    } else {
+        let output = Command::new("hyprctl")
+            .arg("keyword")
+            .arg("group:group_on_movetoworkspace")
+            .arg(if enabled { "true" } else { "false" })
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "keyword failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
 /// Switch the focused monitor to a workspace (by numeric id).
 pub fn focus_workspace(id: i32) -> Result<(), Box<dyn Error>> {
     let arg = if lua_parser() {
