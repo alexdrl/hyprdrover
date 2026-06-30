@@ -309,6 +309,34 @@ fn restore_groups(snapshot: &SessionSnapshot, addr_map: &HashMap<String, String>
             continue;
         }
         let dest = workspace_target(&group[0].workspace);
+
+        // Leave already-correct groups untouched: if the live windows already
+        // form exactly this group, don't dissolve and rebuild it.
+        if let Some(current_ws) = existing_group_ws(&members) {
+            if current_ws == dest {
+                println!(
+                    "   = Group ({}) already intact on {}; leaving as-is",
+                    label,
+                    workspace_label(&group[0].workspace)
+                );
+                continue;
+            }
+            // Intact but on the wrong workspace: relocate the whole group
+            // (moving one tab drags all of it) without dissolving it. OFF so it
+            // doesn't merge into another group already at the destination.
+            println!(
+                "   ↪ Group ({}) intact; moving to {}",
+                label,
+                workspace_label(&group[0].workspace)
+            );
+            let _ = ipc::set_group_on_movetoworkspace(false);
+            let _ = ipc::focus_window(&members[0]);
+            let _ = ipc::move_window_to_workspace_target(&members[0], &dest);
+            thread::sleep(Duration::from_millis(300));
+            let _ = ipc::set_group_on_movetoworkspace(true);
+            continue;
+        }
+
         println!(
             "   ⊞ Grouping {} window(s) ({}) on {}",
             members.len(),
@@ -377,6 +405,21 @@ fn dissolve_group(address: &str) -> Result<(), Box<dyn Error>> {
         wait_until(|| grouped_count(address) <= 1, Duration::from_secs(2));
     }
     Ok(())
+}
+
+/// If the live windows for `members` already form *exactly* this group (same
+/// member set, no more, no fewer), returns the workspace target they're on;
+/// otherwise `None`. Used to skip rebuilding groups that are already correct.
+fn existing_group_ws(members: &[String]) -> Option<String> {
+    let state = ipc::capture_state().ok()?;
+    let target: HashSet<&str> = members.iter().map(|s| s.as_str()).collect();
+    let lead = state.clients.iter().find(|c| c.address == members[0])?;
+    let current: HashSet<&str> = lead.grouped.iter().map(|s| s.as_str()).collect();
+    if current == target {
+        Some(workspace_target(&lead.workspace))
+    } else {
+        None
+    }
 }
 
 /// Number of windows in the group the given address belongs to (0 if ungrouped).
