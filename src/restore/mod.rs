@@ -118,6 +118,13 @@ fn resolve_launch(saved: &HyprClient) -> Vec<String> {
             ];
         }
     }
+    // Flatpak apps: their captured command/exe_path point inside the sandbox and
+    // aren't runnable from the host — launch via `flatpak run <app-id>`.
+    if let Some(app_id) = &saved.flatpak {
+        if !app_id.is_empty() {
+            return vec!["flatpak".to_string(), "run".to_string(), app_id.clone()];
+        }
+    }
     if let Some(cmd) = &saved.command {
         if !cmd.is_empty() {
             return cmd.clone();

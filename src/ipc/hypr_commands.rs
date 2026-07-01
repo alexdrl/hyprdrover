@@ -52,6 +52,13 @@ pub struct HyprClient {
     /// reflects the tab order. Reported directly by `hyprctl clients`.
     #[serde(default)]
     pub grouped: Vec<String>,
+
+    /// Flatpak application id (e.g. `com.spotify.Client`) when the window
+    /// belongs to a Flatpak sandbox. Such apps must be relaunched with
+    /// `flatpak run <id>`; their `command`/`exe_path` point inside the sandbox
+    /// and aren't executable from the host.
+    #[serde(default)]
+    pub flatpak: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -132,11 +139,34 @@ pub fn get_active_workspace() -> Result<HyprActiveWorkspace, Box<dyn Error>> {
     Ok(serde_json::from_str(&json)?)
 }
 
+/// Extract a Flatpak app id from a cgroup line such as
+/// `0::/user.slice/.../app-flatpak-com.spotify.Client-816252360.scope`.
+/// Returns e.g. `com.spotify.Client`, or `None` if not a Flatpak scope.
+fn parse_flatpak_app_id(cgroup: &str) -> Option<String> {
+    const MARKER: &str = "app-flatpak-";
+    let start = cgroup.find(MARKER)? + MARKER.len();
+    let rest = &cgroup[start..];
+    let end = rest.find(".scope")?;
+    let token = &rest[..end]; // e.g. "com.spotify.Client-816252360"
+    match token.rsplit_once('-') {
+        // Strip the trailing "-<instance-number>" if present.
+        Some((id, num)) if !id.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(id.to_string())
+        }
+        _ => Some(token.to_string()),
+    }
+}
+
 /// Capture the entire current state of Hyprland
 pub fn capture_state() -> Result<SessionSnapshot, Box<dyn Error>> {
     let mut clients = get_clients()?;
 
     for client in &mut clients {
+        // Flatpak app id from the process cgroup, if sandboxed.
+        if let Ok(cgroup) = fs::read_to_string(format!("/proc/{}/cgroup", client.pid)) {
+            client.flatpak = parse_flatpak_app_id(&cgroup);
+        }
+
         let cmdline_path = format!("/proc/{}/cmdline", client.pid);
         let exe_path = format!("/proc/{}/exe", client.pid);
 
