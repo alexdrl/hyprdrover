@@ -145,11 +145,14 @@ fn resolve_launch(saved: &HyprClient) -> Vec<String> {
 
 /// Parse a Chromium/Edge PWA window class into `(app_id, profile_directory)`.
 ///
-/// PWAs get a class like `msedge-_<app_id>-<profile>` (e.g.
-/// `msedge-_kldaona...-Default`). The app id is the 32-char Chromium id (a–p),
-/// which is exactly what `--app-id=` expects. Returns `None` for non-PWA classes.
+/// PWAs get a class like `msedge-<app_id>-<profile>` (e.g.
+/// `msedge-kldaona...-Default`). Under XWayland the browser sets the class
+/// with an extra underscore: `msedge-_<app_id>-<profile>`. Both forms are
+/// accepted. The app id is the 32-char Chromium id (a–p), which is exactly
+/// what `--app-id=` expects. Returns `None` for non-PWA classes.
 fn parse_pwa_class(class: &str) -> Option<(String, String)> {
-    let after = class.split_once("-_")?.1; // "<app_id>-<profile>"
+    let (_, after) = class.split_once('-')?; // "[_]<app_id>-<profile>"
+    let after = after.strip_prefix('_').unwrap_or(after);
     let (app_id, profile) = after.split_once('-')?;
     let is_chromium_app_id =
         app_id.len() == 32 && app_id.bytes().all(|b| (b'a'..=b'p').contains(&b));
@@ -160,12 +163,25 @@ fn parse_pwa_class(class: &str) -> Option<(String, String)> {
     }
 }
 
+/// Key used to compare window classes. Lowercase; for a Chromium/Edge PWA the
+/// key is `pwa:<app_id>:<profile>`, so the Wayland form (`msedge-<id>-Default`)
+/// and the XWayland form (`msedge-_<id>-Default`) of the same app match.
+fn class_key(class: &str) -> String {
+    match parse_pwa_class(class) {
+        Some((app_id, profile)) => format!("pwa:{}:{}", app_id, profile),
+        None => class.to_lowercase(),
+    }
+}
+
 /// The browser binary to relaunch a PWA with: the captured argv[0], else the
 /// kernel exe path.
+///
+/// Sessions saved before the cmdline fix can hold the whole Chromium command
+/// line as one element; only its first token is the binary.
 fn browser_binary(saved: &HyprClient) -> Option<String> {
     if let Some(first) = saved.command.as_ref().and_then(|c| c.first()) {
-        if !first.is_empty() {
-            return Some(first.clone());
+        if let Some(bin) = first.split_whitespace().next() {
+            return Some(bin.to_string());
         }
     }
     saved
@@ -470,14 +486,115 @@ fn launched_window_matches(current: &HyprClient, saved: &HyprClient) -> bool {
         }
     }
 
-    let saved_class = saved.class.to_lowercase();
-    let saved_initial_class = saved.initial_class.to_lowercase();
-    let current_class = current.class.to_lowercase();
-    let current_initial_class = current.initial_class.to_lowercase();
+    let saved_class = class_key(&saved.class);
+    let saved_initial_class = class_key(&saved.initial_class);
+    let current_class = class_key(&current.class);
+    let current_initial_class = class_key(&current.initial_class);
 
     (!saved_class.is_empty()
         && (current_class == saved_class || current_initial_class == saved_class))
         || (!saved_initial_class.is_empty()
             && (current_class == saved_initial_class
                 || current_initial_class == saved_initial_class))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const APP: &str = "kldaonaeondlgcjdncdbnamchihmoalb";
+
+    fn client(class: &str, command: Option<Vec<&str>>) -> HyprClient {
+        HyprClient {
+            address: "0x1".into(),
+            at: [0, 0],
+            size: [1, 1],
+            workspace: HyprWorkspaceRef { id: 1, name: "1".into() },
+            class: class.into(),
+            title: String::new(),
+            initial_class: class.into(),
+            initial_title: String::new(),
+            floating: false,
+            pinned: false,
+            monitor: 0,
+            fullscreen: 0,
+            xwayland: false,
+            pid: 1,
+            command: command.map(|c| c.into_iter().map(str::to_owned).collect()),
+            exe_path: None,
+            grouped: vec![],
+            flatpak: None,
+        }
+    }
+
+    #[test]
+    fn pwa_class_wayland_form() {
+        assert_eq!(
+            parse_pwa_class(&format!("msedge-{}-Default", APP)),
+            Some((APP.to_string(), "Default".to_string()))
+        );
+    }
+
+    #[test]
+    fn pwa_class_xwayland_form() {
+        assert_eq!(
+            parse_pwa_class(&format!("msedge-_{}-Default", APP)),
+            Some((APP.to_string(), "Default".to_string()))
+        );
+    }
+
+    #[test]
+    fn pwa_class_rejects_plain_browser_and_others() {
+        assert_eq!(parse_pwa_class("msedge"), None);
+        assert_eq!(parse_pwa_class("org.telegram.desktop"), None);
+        assert_eq!(parse_pwa_class("com.mitchellh.ghostty"), None);
+        assert_eq!(parse_pwa_class(&format!("msedge-{}-", APP)), None);
+    }
+
+    #[test]
+    fn saved_xwayland_pwa_matches_live_wayland_pwa() {
+        let saved = client(&format!("msedge-_{}-Default", APP), None);
+        let live = client(&format!("msedge-{}-Default", APP), None);
+        assert!(launched_window_matches(&live, &saved));
+    }
+
+    #[test]
+    fn different_pwas_do_not_match() {
+        let saved = client(&format!("msedge-_{}-Default", APP), None);
+        let live = client("msedge-pkooggnaalmfkidjmlhoelhdllpphaga-Default", None);
+        assert!(!launched_window_matches(&live, &saved));
+    }
+
+    #[test]
+    fn pwa_launch_from_old_session_with_joined_cmdline() {
+        let saved = client(
+            &format!("msedge-_{}-Default", APP),
+            Some(vec![
+                "/opt/microsoft/msedge/msedge --profile-directory=Default --app-id=pkooggnaalmfkidjmlhoelhdllpphaga",
+            ]),
+        );
+        assert_eq!(resolve_launch(&saved)[0], "/opt/microsoft/msedge/msedge");
+        assert_eq!(resolve_launch(&saved).len(), 3);
+    }
+
+    #[test]
+    fn pwa_launch_uses_binary_only() {
+        let saved = client(
+            &format!("msedge-_{}-Default", APP),
+            Some(vec![
+                "/opt/microsoft/msedge/msedge",
+                "--profile-directory=Default",
+                "--app-id=pkooggnaalmfkidjmlhoelhdllpphaga",
+                "--app-url=https://outlook.office365.com/mail/",
+            ]),
+        );
+        assert_eq!(
+            resolve_launch(&saved),
+            vec![
+                "/opt/microsoft/msedge/msedge",
+                "--profile-directory=Default",
+                &format!("--app-id={}", APP),
+            ]
+        );
+    }
 }

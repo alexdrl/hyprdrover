@@ -157,6 +157,24 @@ fn parse_flatpak_app_id(cgroup: &str) -> Option<String> {
     }
 }
 
+/// Split a `/proc/<pid>/cmdline` buffer into argv.
+///
+/// Normal processes separate the arguments with NUL bytes. Chromium-based
+/// browsers (Edge, Chrome, Electron) rewrite their argv area at startup and
+/// leave one string with the arguments joined by spaces. In that case split on
+/// whitespace, so that `args[0]` is the binary and not the whole command line.
+fn parse_cmdline(bytes: &[u8]) -> Vec<String> {
+    let args: Vec<String> = bytes
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    if args.len() == 1 && args[0].contains(char::is_whitespace) {
+        return args[0].split_whitespace().map(str::to_owned).collect();
+    }
+    args
+}
+
 /// Capture the entire current state of Hyprland
 pub fn capture_state() -> Result<SessionSnapshot, Box<dyn Error>> {
     let mut clients = get_clients()?;
@@ -172,11 +190,7 @@ pub fn capture_state() -> Result<SessionSnapshot, Box<dyn Error>> {
 
         // Prefer full argv from /proc/<pid>/cmdline
         if let Ok(bytes) = fs::read(&cmdline_path) {
-            let args: Vec<String> = bytes
-                .split(|b| *b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).into_owned())
-                .collect();
+            let args = parse_cmdline(&bytes);
 
             if !args.is_empty() {
                 client.command = Some(args);
@@ -395,4 +409,35 @@ pub fn exec_on_workspace(cmd: &str, target: &str) -> Result<(), Box<dyn Error>> 
         format!("exec [workspace {} silent] {}", target, cmd)
     };
     dispatch_arg(&arg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cmdline;
+
+    #[test]
+    fn cmdline_nul_separated() {
+        let args = parse_cmdline(b"/usr/bin/foo\0--flag\0a b\0");
+        assert_eq!(args, vec!["/usr/bin/foo", "--flag", "a b"]);
+    }
+
+    #[test]
+    fn cmdline_rewritten_by_chromium() {
+        let args = parse_cmdline(
+            b"/opt/microsoft/msedge/msedge --profile-directory=Default --app-id=kldaonaeondlgcjdncdbnamchihmoalb",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "/opt/microsoft/msedge/msedge",
+                "--profile-directory=Default",
+                "--app-id=kldaonaeondlgcjdncdbnamchihmoalb",
+            ]
+        );
+    }
+
+    #[test]
+    fn cmdline_single_arg_without_spaces() {
+        assert_eq!(parse_cmdline(b"/usr/bin/foo\0"), vec!["/usr/bin/foo"]);
+    }
 }
